@@ -31,8 +31,8 @@ android {
         applicationId = "com.vesper.flipper"
         minSdk = 26
         targetSdk = 35
-        versionCode = 3
-        versionName = "1.0.2-providers-updates"
+        versionCode = 4
+        versionName = "1.0.3-providers-updates"
         buildConfigField("String", "UPDATE_REPOSITORY", "\"$updateRepository\"")
         buildConfigField("String", "UPDATE_CHANNEL", "\"$updateChannel\"")
         buildConfigField("String", "UPDATE_CAPABILITIES", "\"multi-provider-v1,exact-model-id-v1,safe-update-check-v1\"")
