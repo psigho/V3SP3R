@@ -42,6 +42,13 @@ jobs:
         run: |
           java -cp gradle/wrapper/gradle-wrapper.jar org.gradle.wrapper.GradleWrapperMain :app:testDebugUnitTest :app:lintDebug :app:assembleDebug --continue --console=plain --max-workers=2
 
+      - name: Run BLE lifecycle component regressions
+        shell: bash
+        env:
+          VESPER_TEST_TMP: ${{ runner.temp }}/vesper-lifecycle-tests
+        run: |
+          python app/src/test/java/com/vesper/flipper/ble/run_lifecycle_tests.py
+
       - name: Record source revision
         if: success()
         shell: bash
