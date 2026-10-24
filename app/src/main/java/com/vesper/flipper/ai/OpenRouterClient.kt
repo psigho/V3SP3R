@@ -2,6 +2,9 @@ package com.vesper.flipper.ai
 
 import android.util.Log
 import com.vesper.flipper.data.SettingsStore
+import com.vesper.flipper.data.AiConnectionConfig
+import com.vesper.flipper.data.AiProvider
+import com.vesper.flipper.data.awaitProviderResponse
 import com.vesper.flipper.domain.model.*
 import com.vesper.flipper.security.InputValidator
 import com.vesper.flipper.security.RateLimiter
@@ -9,6 +12,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.withContext
@@ -48,7 +52,10 @@ class OpenRouterClient @Inject constructor(
         .connectTimeout(30, TimeUnit.SECONDS)
         .readTimeout(75, TimeUnit.SECONDS)
         .writeTimeout(30, TimeUnit.SECONDS)
-        .retryOnConnectionFailure(true)
+        .callTimeout(90, TimeUnit.SECONDS)
+        .followRedirects(false)
+        .followSslRedirects(false)
+        .retryOnConnectionFailure(false)
         .build()
 
     // Rate limiter: 30 requests per minute
@@ -72,7 +79,8 @@ class OpenRouterClient @Inject constructor(
      */
     suspend fun chat(
         messages: List<ChatMessage>,
-        sessionId: String
+        sessionId: String,
+        connection: AiConnectionConfig? = null
     ): ChatCompletionResult = withContext(Dispatchers.IO) {
         // Check rate limit
         if (!rateLimiter.tryAcquire()) {
@@ -82,15 +90,10 @@ class OpenRouterClient @Inject constructor(
             )
         }
 
-        val apiKey = settingsStore.apiKey.first()
-            ?: return@withContext ChatCompletionResult.Error("OpenRouter API key not configured")
-
-        // Validate API key format
-        if (!InputValidator.isValidApiKey(apiKey)) {
-            return@withContext ChatCompletionResult.Error("Invalid API key format")
-        }
-
-        val model = settingsStore.selectedModel.first()
+        val config = connection ?: currentCoroutineContext()[AiConnectionContext]?.connection
+            ?: settingsStore.aiConnectionConfig.first()
+        config.validationError()?.let { return@withContext ChatCompletionResult.Error(it) }
+        val model = config.model
 
         val compactMessages = trimConversationForRequest(messages)
 
@@ -100,7 +103,7 @@ class OpenRouterClient @Inject constructor(
         val hasImages = compactMessages.any { !it.imageAttachments.isNullOrEmpty() }
         val processedMessages = if (hasImages) {
             Log.w(TAG, "chat(): images still present at chat() entry — running safety-net preprocessing")
-            preprocessImagesAsText(compactMessages, apiKey)
+            preprocessImagesAsText(compactMessages, config)
         } else {
             compactMessages
         }
@@ -118,68 +121,13 @@ class OpenRouterClient @Inject constructor(
             addAll(sanitizeAndBuildRequestMessages(processedMessages))
         }
 
-        val candidateModels = buildToolModelCandidates(model)
-        var lastError: ChatCompletionResult.Error? = null
-        val attemptedModels = mutableListOf<String>()
-        val unsupportedModels = mutableListOf<String>()
-
-        for (candidateModel in candidateModels) {
-            attemptedModels.add(candidateModel)
-
-            if (isToolModelTemporarilyBlocked(candidateModel)) {
-                unsupportedModels.add(candidateModel)
-                continue
-            }
-
-            val result = executeWithRetry(
-                buildToolCallingRequest(
-                    apiKey = apiKey,
-                    model = candidateModel,
-                    messages = requestMessages,
-                    includeGlassesActions = glassesEnabled
-                )
-            )
-
-            when (result) {
-                is ChatCompletionResult.Success -> {
-                    toolUnsupportedModels.remove(candidateModel)
-                    return@withContext result
-                }
-
-                is ChatCompletionResult.Error -> {
-                    lastError = result
-
-                    if (isToolResultPairingError(result.message)) {
-                        return@withContext ChatCompletionResult.Error(
-                            "Tool-call history is out of sync for this conversation. Start a new chat session and retry."
-                        )
-                    }
-
-                    if (isToolUseUnsupportedError(result.message)) {
-                        markToolModelUnsupported(candidateModel)
-                        unsupportedModels.add(candidateModel)
-                        continue
-                    }
-
-                    if (isModelAvailabilityError(result.message)) {
-                        continue
-                    }
-
-                    return@withContext result
-                }
-            }
-        }
-
-        val uniqueUnsupported = unsupportedModels.distinct()
-        if (uniqueUnsupported.isNotEmpty()) {
-            val attemptedPreview = attemptedModels.distinct().take(MAX_ERROR_MODEL_LIST).joinToString(", ")
+        val result = executeWithRetry(buildToolCallingRequest(config, model, requestMessages, glassesEnabled))
+        if (result is ChatCompletionResult.Error && isToolResultPairingError(result.message)) {
             return@withContext ChatCompletionResult.Error(
-                "No tool-use endpoints were available for the configured model set. " +
-                        "Tried: $attemptedPreview. Select a tool-capable model in Settings."
+                "Tool-call history is out of sync for this conversation. Start a new chat session and retry."
             )
         }
-
-        lastError ?: ChatCompletionResult.Error("Unable to find a working model for tool execution.")
+        result
     }
 
     /**
@@ -190,7 +138,7 @@ class OpenRouterClient @Inject constructor(
      */
     internal suspend fun preprocessImagesAsText(
         messages: List<ChatMessage>,
-        apiKey: String
+        config: AiConnectionConfig
     ): List<ChatMessage> = coroutineScope {
         val imageCount = messages.sumOf { it.imageAttachments?.size ?: 0 }
         Log.d(TAG, "preprocessImagesAsText: processing $imageCount image(s) across ${messages.size} message(s)")
@@ -200,7 +148,7 @@ class OpenRouterClient @Inject constructor(
 
             // Process all images in parallel for faster response
             val results = msg.imageAttachments.map { attachment ->
-                async { describeImage(apiKey, attachment) }
+                async { describeImage(config, attachment) }
             }.awaitAll()
             val descriptions = results.filterNotNull()
             val failedCount = results.size - descriptions.size
@@ -245,10 +193,9 @@ class OpenRouterClient @Inject constructor(
         attachment: ImageAttachment,
         prompt: String
     ): String? = withContext(Dispatchers.IO) {
-        val apiKey = settingsStore.apiKey.first() ?: run {
-            Log.w(TAG, "describeImageForAgent: no API key configured")
-            return@withContext null
-        }
+        val config = currentCoroutineContext()[AiConnectionContext]?.connection
+            ?: settingsStore.aiConnectionConfig.first()
+        if (config.validationError() != null) return@withContext null
 
         val visionMessages = listOf(
             OpenRouterMessage.text(
@@ -268,7 +215,7 @@ class OpenRouterClient @Inject constructor(
             )
         )
 
-        for (model in VISION_MODEL_CANDIDATES) {
+        for (model in listOf(config.model)) {
             try {
                 Log.d(TAG, "describeImageForAgent: trying model $model")
                 val request = OpenRouterRequest(
@@ -279,17 +226,7 @@ class OpenRouterClient @Inject constructor(
                     maxTokens = 500
                 )
 
-                val requestBody = json.encodeToString(request)
-                    .toRequestBody("application/json".toMediaType())
-
-                val httpRequest = Request.Builder()
-                    .url(OPENROUTER_API_URL)
-                    .addHeader("Authorization", "Bearer $apiKey")
-                    .addHeader("Content-Type", "application/json")
-                    .addHeader("HTTP-Referer", "https://vesper.flipper.app")
-                    .addHeader("X-Title", "Vesper Flipper Control")
-                    .post(requestBody)
-                    .build()
+                val httpRequest = buildCompletionRequest(config, request)
 
                 val result = executeWithRetry(httpRequest)
                 when (result) {
@@ -305,6 +242,8 @@ class OpenRouterClient @Inject constructor(
                         Log.w(TAG, "describeImageForAgent: $model failed: ${result.message}")
                     }
                 }
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
             } catch (e: Exception) {
                 Log.w(TAG, "describeImageForAgent: exception with $model: ${e.message}")
             }
@@ -320,9 +259,11 @@ class OpenRouterClient @Inject constructor(
      * deprecation or temporary outages on OpenRouter.
      */
     private suspend fun describeImage(
-        apiKey: String,
+        config: AiConnectionConfig,
         attachment: ImageAttachment
     ): String? = withContext(Dispatchers.IO) {
+        if (config.validationError() != null) return@withContext null
+        val apiKey = config.apiKey!!
         val base64Len = attachment.base64Data.length
         Log.d(TAG, "describeImage: starting vision call (mime=${attachment.mimeType}, base64len=$base64Len)")
 
@@ -344,7 +285,7 @@ class OpenRouterClient @Inject constructor(
             )
         )
 
-        for (model in VISION_MODEL_CANDIDATES) {
+        for (model in listOf(config.model)) {
             try {
                 Log.d(TAG, "describeImage: trying model $model")
 
@@ -356,17 +297,7 @@ class OpenRouterClient @Inject constructor(
                     maxTokens = 300
                 )
 
-                val requestBody = json.encodeToString(request)
-                    .toRequestBody("application/json".toMediaType())
-
-                val httpRequest = Request.Builder()
-                    .url(OPENROUTER_API_URL)
-                    .addHeader("Authorization", "Bearer $apiKey")
-                    .addHeader("Content-Type", "application/json")
-                    .addHeader("HTTP-Referer", "https://vesper.flipper.app")
-                    .addHeader("X-Title", "Vesper Flipper Control")
-                    .post(requestBody)
-                    .build()
+                val httpRequest = buildCompletionRequest(config, request)
 
                 val result = executeWithRetry(httpRequest)
                 when (result) {
@@ -382,6 +313,8 @@ class OpenRouterClient @Inject constructor(
                         Log.w(TAG, "describeImage: $model failed: ${result.message}, trying next model")
                     }
                 }
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
             } catch (e: Exception) {
                 Log.w(TAG, "describeImage: exception with $model: ${e.message}, trying next model")
             }
@@ -399,10 +332,11 @@ class OpenRouterClient @Inject constructor(
     suspend fun chatSimple(prompt: String): String? = withContext(Dispatchers.IO) {
         if (!rateLimiter.tryAcquire()) return@withContext null
 
-        val apiKey = settingsStore.apiKey.first() ?: return@withContext null
-        if (!InputValidator.isValidApiKey(apiKey)) return@withContext null
-
-        val model = settingsStore.selectedModel.first()
+        val config = currentCoroutineContext()[AiConnectionContext]?.connection
+            ?: settingsStore.aiConnectionConfig.first()
+        if (config.validationError() != null) return@withContext null
+        val apiKey = config.apiKey!!
+        val model = config.model
         val messages = listOf(
             OpenRouterMessage.text(role = "user", content = prompt)
         )
@@ -415,17 +349,7 @@ class OpenRouterClient @Inject constructor(
             maxTokens = FORGE_RESPONSE_MAX_TOKENS
         )
 
-        val requestBody = json.encodeToString(request)
-            .toRequestBody("application/json".toMediaType())
-
-        val httpRequest = Request.Builder()
-            .url(OPENROUTER_API_URL)
-            .addHeader("Authorization", "Bearer $apiKey")
-            .addHeader("Content-Type", "application/json")
-            .addHeader("HTTP-Referer", "https://vesper.flipper.app")
-            .addHeader("X-Title", "Vesper Flipper Control")
-            .post(requestBody)
-            .build()
+        val httpRequest = buildCompletionRequest(config, request)
 
         val result = executeWithRetry(httpRequest)
         when (result) {
@@ -434,8 +358,39 @@ class OpenRouterClient @Inject constructor(
         }
     }
 
+    /** Explicit user action: a small completion, not a tool-capability test. */
+    suspend fun testConnection(config: AiConnectionConfig): Result<String> = withContext(Dispatchers.IO) {
+        config.validationError()?.let { return@withContext Result.failure(IllegalArgumentException(it)) }
+        if (!rateLimiter.tryAcquire()) return@withContext Result.failure(IOException("Rate limit exceeded. Wait and retry."))
+        val payload = OpenRouterRequest(
+            model = config.model,
+            messages = listOf(OpenRouterMessage.text("user", "Reply with OK.")),
+            tools = null,
+            toolChoice = null,
+            maxTokens = 16
+        )
+        when (val result = executeWithRetry(buildCompletionRequest(config, payload), maxAttempts = 1)) {
+            is ChatCompletionResult.Success -> if (result.content.isNotBlank()) {
+                Result.success("Completion verified. Tool calling and vision were not tested.")
+            } else Result.failure(IOException("Provider returned no completion text. Try a compatible chat model."))
+            is ChatCompletionResult.Error -> Result.failure(IOException(result.message))
+        }
+    }
+
+    private fun buildCompletionRequest(config: AiConnectionConfig, payload: OpenRouterRequest): Request {
+        val builder = Request.Builder()
+            .url("${config.provider.baseUrl}/chat/completions")
+            .header("Authorization", "Bearer ${config.apiKey}")
+            .header("Content-Type", "application/json")
+        if (config.provider == AiProvider.OPENROUTER) {
+            builder.header("HTTP-Referer", "https://vesper.flipper.app")
+                .header("X-Title", "Vesper Flipper Control")
+        }
+        return builder.post(json.encodeToString(payload).toRequestBody("application/json".toMediaType())).build()
+    }
+
     private fun buildToolCallingRequest(
-        apiKey: String,
+        config: AiConnectionConfig,
         model: String,
         messages: List<OpenRouterMessage>,
         includeGlassesActions: Boolean = false
@@ -449,88 +404,77 @@ class OpenRouterClient @Inject constructor(
             maxTokens = TOOL_CALL_RESPONSE_MAX_TOKENS
         )
 
-        val requestBody = json.encodeToString(request)
-            .toRequestBody("application/json".toMediaType())
-
-        return Request.Builder()
-            .url(OPENROUTER_API_URL)
-            .addHeader("Authorization", "Bearer $apiKey")
-            .addHeader("Content-Type", "application/json")
-            .addHeader("HTTP-Referer", "https://vesper.flipper.app")
-            .addHeader("X-Title", "Vesper Flipper Control")
-            .post(requestBody)
-            .build()
+        return buildCompletionRequest(config, request)
     }
 
     /**
      * Execute HTTP request with exponential backoff retry for transient failures.
      */
-    private suspend fun executeWithRetry(request: Request): ChatCompletionResult {
-        var lastException: Exception? = null
+    private suspend fun executeWithRetry(
+        request: Request,
+        maxAttempts: Int = RetryConfig.MAX_RETRIES
+    ): ChatCompletionResult {
         var delayMs = RetryConfig.INITIAL_DELAY_MS
-
-        repeat(RetryConfig.MAX_RETRIES) { attempt ->
+        repeat(maxAttempts) { attempt ->
             try {
-                client.newCall(request).execute().use { response ->
-                    val responseBody = response.body?.string()
-
-                    // Check for rate limit from server
-                    if (response.code == 429) {
-                        val retryAfter = response.header("Retry-After")?.toLongOrNull() ?: 60
-                        delay(retryAfter * 1000)
-                        return@repeat // Retry
+                val response = client.newCall(request).awaitProviderResponse()
+                val body = response.body
+                val text = body.orEmpty().lowercase()
+                val permanent = listOf("model_not_found", "model_not_yet_available", "key_unavailable", "policy_violation")
+                    .any { it in text }
+                if (!response.isSuccessful) {
+                    val error = ChatCompletionResult.Error(providerError(response.code, body))
+                    if (permanent || attempt == maxAttempts - 1) return error
+                    when (response.code) {
+                        429 -> {
+                            val seconds = response.retryAfter?.toLongOrNull()
+                            // Never overflow or hold the UI for an unbounded Retry-After.
+                            if (seconds == null || seconds !in 0..(RetryConfig.MAX_DELAY_MS / 1000)) return error
+                            delay(seconds * 1000)
+                        }
+                        in 500..599 -> delay(delayMs)
+                        else -> return error
                     }
-
-                    // Check for server errors (5xx) - these are retryable
-                    if (response.code in 500..599) {
-                        lastException = IOException("Server error: ${response.code}")
-                        delay(delayMs)
-                        delayMs = (delayMs * RetryConfig.BACKOFF_MULTIPLIER).toLong()
-                            .coerceAtMost(RetryConfig.MAX_DELAY_MS)
-                        return@repeat // Retry
-                    }
-
-                    // Client errors (4xx except 429) are not retryable
-                    if (!response.isSuccessful) {
-                        return ChatCompletionResult.Error(
-                            "API error: ${response.code} - ${responseBody ?: "Unknown error"}"
-                        )
-                    }
-
-                    if (responseBody == null) {
-                        return ChatCompletionResult.Error("Empty response from API")
-                    }
-
-                    return parseResponse(responseBody)
+                } else {
+                    if (body == null) return ChatCompletionResult.Error("Empty response from API")
+                    return parseResponse(body)
                 }
-
-            } catch (e: SocketTimeoutException) {
-                lastException = e
-                delay(delayMs)
-                delayMs = (delayMs * RetryConfig.BACKOFF_MULTIPLIER).toLong()
-                    .coerceAtMost(RetryConfig.MAX_DELAY_MS)
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
             } catch (e: IOException) {
                 if (isDnsResolutionFailure(e)) {
-                    return ChatCompletionResult.Error(DNS_RESOLUTION_ERROR_MESSAGE)
+                    return ChatCompletionResult.Error("Cannot resolve ${request.url.host}. Check internet access, Private DNS and VPN settings.")
                 }
-                lastException = e
+                if (attempt == maxAttempts - 1) {
+                    return ChatCompletionResult.Error("Provider request timed out or failed. Check connectivity and retry.")
+                }
                 delay(delayMs)
-                delayMs = (delayMs * RetryConfig.BACKOFF_MULTIPLIER).toLong()
-                    .coerceAtMost(RetryConfig.MAX_DELAY_MS)
-            } catch (e: Exception) {
-                // Non-retryable exception
-                return ChatCompletionResult.Error("Request failed: ${e.message}")
+            } catch (_: Exception) {
+                return ChatCompletionResult.Error("Provider request failed. Check connection settings and retry.")
             }
+            delayMs = (delayMs * RetryConfig.BACKOFF_MULTIPLIER).toLong().coerceAtMost(RetryConfig.MAX_DELAY_MS)
         }
-
-        return ChatCompletionResult.Error(
-            "Request failed after ${RetryConfig.MAX_RETRIES} attempts: ${lastException?.message}"
-        )
+        return ChatCompletionResult.Error("Provider request failed after $maxAttempts attempts.")
     }
 
-    /**
-     * Parse and validate the API response.
-     */
+    private fun providerError(code: Int, body: String?): String {
+        val text = body.orEmpty().lowercase()
+        val advice = when {
+            isToolResultPairingError(text) -> "Tool-call history is out of sync. Start a new conversation."
+            text.contains("model_not_found") || code == 404 -> "Model not available. Check the exact model ID and account access in Settings."
+            text.contains("tool") && (text.contains("support") || text.contains("allow")) -> "This model does not support tool calling. Select a tool-capable model in Settings."
+            text.contains("image") && (text.contains("support") || text.contains("allow")) -> "This model does not support images. Select a vision-capable model in Settings."
+            code == 401 -> "Authentication failed. Check the API key for the selected provider."
+            code == 402 -> "Insufficient credits or quota. Check the selected provider's billing."
+            code == 403 -> "Access denied. Check key permissions, model access, account limits and provider policy."
+            code == 429 -> "Rate limited. Wait before retrying."
+            code in 300..399 -> "Redirect refused to protect the API key. Verify the provider endpoint."
+            code in 500..599 -> "Provider temporarily unavailable. Retry later."
+            else -> "Request rejected. Verify the exact model ID and the model's supported features."
+        }
+        return "API error $code: $advice"
+    }
+
     private fun parseResponse(responseBody: String): ChatCompletionResult {
         return try {
             val root = try {
@@ -543,10 +487,8 @@ class OpenRouterClient @Inject constructor(
             // Error responses look like: {"error": {"message": "...", "code": 400}}
             val errorObj = root["error"]?.jsonObject
             if (errorObj != null) {
-                val errorMsg = errorObj["message"]?.jsonPrimitive?.contentOrNull ?: "Unknown API error"
-                val errorCode = errorObj["code"]?.jsonPrimitive?.intOrNull
-                Log.e(TAG, "OpenRouter API error (code=$errorCode): $errorMsg")
-                return ChatCompletionResult.Error("API error${errorCode?.let { " $it" } ?: ""}: $errorMsg")
+                val errorCode = errorObj["code"]?.jsonPrimitive?.intOrNull ?: 200
+                return ChatCompletionResult.Error(providerError(errorCode, responseBody))
             }
 
             val apiResponse = json.decodeFromString<OpenRouterResponse>(responseBody)
@@ -554,7 +496,7 @@ class OpenRouterClient @Inject constructor(
             // Warn on missing ID but don't reject — some providers omit it for
             // simple completions (e.g. vision-only calls).
             if (apiResponse.id.isBlank()) {
-                Log.w(TAG, "Response missing ID. Body preview: ${responseBody.take(200)}")
+                Log.w(TAG, "Response missing ID")
             }
 
             val choice = apiResponse.choices.firstOrNull()
@@ -595,7 +537,7 @@ class OpenRouterClient @Inject constructor(
                 tokensUsed = apiResponse.usage?.totalTokens
             )
         } catch (e: Exception) {
-            ChatCompletionResult.Error("Failed to parse response: ${e.message}")
+            ChatCompletionResult.Error("Failed to parse provider response")
         }
     }
 
@@ -1016,8 +958,8 @@ class OpenRouterClient @Inject constructor(
                         // Drop any buffered trailing comma before a closer
                         pendingComma = null
                         sb.append(ch)
-                        if (ch == '}' && stack.lastOrNull() == '{') stack.removeLast()
-                        else if (ch == ']' && stack.lastOrNull() == '[') stack.removeLast()
+                        if (ch == '}' && stack.lastOrNull() == '{') stack.removeAt(stack.lastIndex)
+                        else if (ch == ']' && stack.lastOrNull() == '[') stack.removeAt(stack.lastIndex)
                     }
                     else -> {
                         if (ch.isWhitespace() && pendingComma != null) {
@@ -1275,13 +1217,10 @@ class OpenRouterClient @Inject constructor(
             return@withContext Result.failure(Exception("Rate limit exceeded"))
         }
 
-        val apiKey = settingsStore.apiKey.first()
-            ?: return@withContext Result.failure(Exception("API key not configured"))
-        if (!InputValidator.isValidApiKey(apiKey)) {
-            return@withContext Result.failure(Exception("Invalid API key format"))
-        }
-
-        val model = settingsStore.selectedModel.first()
+        val config = settingsStore.aiConnectionConfig.first()
+        config.validationError()?.let { return@withContext Result.failure(IllegalArgumentException(it)) }
+        val apiKey = config.apiKey!!
+        val model = config.model
 
         val compactMessages = trimConversationForRequest(messages)
         val requestMessages = buildList {
@@ -1300,17 +1239,7 @@ class OpenRouterClient @Inject constructor(
             maxTokens = DEFAULT_RESPONSE_MAX_TOKENS
         )
 
-        val requestBody = json.encodeToString(request)
-            .toRequestBody("application/json".toMediaType())
-
-        val httpRequest = Request.Builder()
-            .url(OPENROUTER_API_URL)
-            .addHeader("Authorization", "Bearer $apiKey")
-            .addHeader("Content-Type", "application/json")
-            .addHeader("HTTP-Referer", "https://vesper.flipper.app")
-            .addHeader("X-Title", "Vesper Flipper Control")
-            .post(requestBody)
-            .build()
+        val httpRequest = buildCompletionRequest(config, request)
 
         when (val result = executeWithRetry(httpRequest)) {
             is ChatCompletionResult.Success -> Result.success(result.content)
