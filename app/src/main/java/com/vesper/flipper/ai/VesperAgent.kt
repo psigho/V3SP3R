@@ -1,6 +1,7 @@
 package com.vesper.flipper.ai
 
 import com.vesper.flipper.data.SettingsStore
+import com.vesper.flipper.data.AiConnectionConfig
 import com.vesper.flipper.data.database.ChatDao
 import com.vesper.flipper.data.database.ChatSessionSummary
 import com.vesper.flipper.data.database.ChatMessageEntity
@@ -13,6 +14,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.serialization.decodeFromString
@@ -69,6 +71,15 @@ class VesperAgent @Inject constructor(
 
     private var currentSessionId: String = UUID.randomUUID().toString()
 
+    // Credentials are retained only while this exact approval is paused, never persisted.
+    private var pendingApprovalConnection: PendingApprovalConnection? = null
+
+    private data class PendingApprovalConnection(
+        val sessionId: String,
+        val approvalId: String,
+        val connection: AiConnectionConfig
+    )
+
     init {
         persistenceScope.launch {
             restorePersistedConversation()
@@ -80,6 +91,7 @@ class VesperAgent @Inject constructor(
      * Start a new conversation session
      */
     fun startNewSession(deviceName: String? = null) {
+        pendingApprovalConnection = null
         currentSessionId = UUID.randomUUID().toString()
         _conversationState.value = ConversationState(sessionId = currentSessionId)
         auditService.startSession(deviceName)
@@ -94,6 +106,7 @@ class VesperAgent @Inject constructor(
         userMessage: String,
         imageAttachments: List<ImageAttachment>? = null
     ): ConversationState {
+        pendingApprovalConnection = null
         val messages = _conversationState.value.messages.toMutableList()
 
         // Add user message with optional images
@@ -173,6 +186,7 @@ class VesperAgent @Inject constructor(
 
         if (messages.isEmpty()) return current
 
+        pendingApprovalConnection = null
         _conversationState.value = current.copy(
             messages = messages,
             isLoading = true,
@@ -201,6 +215,22 @@ class VesperAgent @Inject constructor(
      * Continue after tool approval/rejection
      */
     suspend fun continueAfterApproval(approvalId: String, approved: Boolean): ConversationState {
+        val effectiveApprovalId = _conversationState.value.pendingApproval?.id ?: approvalId
+        val retained = pendingApprovalConnection?.takeIf {
+            it.sessionId == currentSessionId && it.approvalId == effectiveApprovalId
+        }
+        pendingApprovalConnection = null
+        val connection = retained?.connection ?: settingsStore.aiConnectionConfig.first()
+        return withTurnConnection(connection) {
+            continueAfterApprovalWithConnection(approvalId, approved, connection)
+        }
+    }
+
+    private suspend fun continueAfterApprovalWithConnection(
+        approvalId: String,
+        approved: Boolean,
+        connection: AiConnectionConfig
+    ): ConversationState {
         val stateBeforeDecision = _conversationState.value
         val effectiveApprovalId = stateBeforeDecision.pendingApproval?.id ?: approvalId
 
@@ -268,7 +298,7 @@ class VesperAgent @Inject constructor(
             )
 
             // Continue conversation
-            return processAIResponse(messages)
+            return processAIResponseWithConnection(messages, connection)
         }
 
         _conversationState.value = _conversationState.value.copy(
@@ -280,6 +310,34 @@ class VesperAgent @Inject constructor(
     }
 
     private suspend fun processAIResponse(messages: MutableList<ChatMessage>): ConversationState {
+        val connection = settingsStore.aiConnectionConfig.first()
+        return withTurnConnection(connection) {
+            processAIResponseWithConnection(messages, connection)
+        }
+    }
+
+    private suspend fun withTurnConnection(
+        connection: AiConnectionConfig,
+        block: suspend () -> ConversationState
+    ): ConversationState {
+        val sessionId = currentSessionId
+        var completed: ConversationState? = null
+        try {
+            return withContext(AiConnectionContext(connection)) { block() }.also { completed = it }
+        } finally {
+            if (currentSessionId == sessionId) {
+                // An exception/cancellation or terminal response releases the snapshot.
+                pendingApprovalConnection = completed?.pendingApproval?.let {
+                    PendingApprovalConnection(sessionId, it.id, connection)
+                }
+            }
+        }
+    }
+
+    private suspend fun processAIResponseWithConnection(
+        messages: MutableList<ChatMessage>,
+        connection: AiConnectionConfig
+    ): ConversationState {
         var currentMessages = messages
         var iterations = 0
         val maxIterations = runCatching {
@@ -292,10 +350,9 @@ class VesperAgent @Inject constructor(
         var apiMessages: MutableList<ChatMessage> = currentMessages.toMutableList()
         val hasImages = currentMessages.any { !it.imageAttachments.isNullOrEmpty() }
         if (hasImages) {
-            val apiKey = settingsStore.apiKey.first()
-            if (apiKey != null) {
+            if (connection.validationError() == null) {
                 try {
-                    apiMessages = openRouterClient.preprocessImagesAsText(currentMessages, apiKey).toMutableList()
+                    apiMessages = openRouterClient.preprocessImagesAsText(currentMessages, connection).toMutableList()
                 } catch (e: Exception) {
                     if (e is kotlinx.coroutines.CancellationException) throw e
                     // Vision preprocessing failed — create API-only fallback messages
@@ -339,7 +396,7 @@ class VesperAgent @Inject constructor(
             )
 
             // Send API messages (images replaced with text descriptions) to the model
-            val result = openRouterClient.chat(apiMessages, currentSessionId)
+            val result = openRouterClient.chat(apiMessages, currentSessionId, connection)
 
             when (result) {
                 is ChatCompletionResult.Error -> {
@@ -763,6 +820,7 @@ class VesperAgent @Inject constructor(
         if (messages.isEmpty()) return
         val restored = messages.mapNotNull { it.toDomainMessageOrNull() }
         if (restored.isEmpty()) return
+        pendingApprovalConnection = null
         currentSessionId = sessionId
         settingsStore.setLastChatSessionId(sessionId)
         _conversationState.value = ConversationState(
