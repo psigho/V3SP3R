@@ -507,6 +507,12 @@ class OpenRouterClient @Inject constructor(
             // Extract content — OpenRouterResponseMessage.textContent handles
             // both plain string and array-of-parts formats transparently.
             val content = message.textContent ?: ""
+            if (choice.finishReason == "length") {
+                return ChatCompletionResult.Error(
+                    "The model reached its output limit. This reply is incomplete; ask for a shorter reply or explicitly continue. No tool from this incomplete response was executed.",
+                    partialContent = content.takeIf { it.isNotBlank() }
+                )
+            }
 
             // Validate tool calls if present
             val rawToolCalls = message.toolCalls
@@ -1654,7 +1660,7 @@ sealed class ChatCompletionResult {
         val tokensUsed: Int?
     ) : ChatCompletionResult()
 
-    data class Error(val message: String) : ChatCompletionResult()
+    data class Error(val message: String, val partialContent: String? = null) : ChatCompletionResult()
 }
 
 // OpenRouter API models

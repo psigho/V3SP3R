@@ -27,6 +27,10 @@ data class SettingsState(
     val providerMessageIsError: Boolean = false,
     val catalogMessage: String? = null,
     val isTestingProvider: Boolean = false,
+    val isSavingKey: Boolean = false,
+    val isSavingProviderSettings: Boolean = false,
+    val keySaveMessage: String? = null,
+    val keySaveIsError: Boolean = false,
     val apiKey: String = "",
     val selectedModel: String = SettingsStore.DEFAULT_MODEL,
     val aiMaxIterations: Int = SettingsStore.DEFAULT_AI_MAX_ITERATIONS,
@@ -76,6 +80,11 @@ class SettingsViewModel @Inject constructor(
     private var testJob: Job? = null
     private var configGeneration = 0L
     private var activeConfig: AiConnectionConfig? = null
+    private var providerEpoch = 0L
+    private var keyDraftRevision = 0L
+    private var draftRevision = 0L
+    private var pendingSettingsWrites = 0
+    private var providerSuccessConfig: AiConnectionConfig? = null
 
     init {
         loadSettings()
@@ -191,6 +200,8 @@ class SettingsViewModel @Inject constructor(
     private fun observeProviderSettings() {
         viewModelScope.launch {
             settingsStore.aiConnectionConfig.distinctUntilChanged().collect { config ->
+                val sameProvider = _state.value.provider == config.provider
+                if (!sameProvider) providerEpoch++
                 cancelProviderRequests()
                 activeConfig = config
                 _state.update { it.copy(
@@ -198,21 +209,31 @@ class SettingsViewModel @Inject constructor(
                     apiKey = config.apiKey.orEmpty(),
                     selectedModel = config.model,
                     providerReady = true,
-                    providerMessage = null,
+                    // A queued storage emission must not erase a write error or its confirmation.
+                    providerMessage = it.providerMessage.takeIf { _ ->
+                        sameProvider && (it.providerMessageIsError || providerSuccessConfig == config)
+                    },
+                    providerMessageIsError = sameProvider && it.providerMessageIsError,
+                    keySaveMessage = it.keySaveMessage.takeIf { sameProvider },
+                    keySaveIsError = sameProvider && it.keySaveIsError,
                     catalogMessage = null,
                     isTestingProvider = false
                 ) }
+                if (providerSuccessConfig != config) providerSuccessConfig = null
             }
         }
     }
 
     fun setProvider(provider: AiProvider) {
         if (!_state.value.providerReady || provider == _state.value.provider) return
+        providerEpoch++
+        providerSuccessConfig = null
         cancelProviderRequests()
         activeConfig = null
         _state.update { it.copy(
             provider = provider, apiKey = "", selectedModel = "", providerReady = false,
-            providerMessage = null, catalogMessage = null, isTestingProvider = false
+            providerMessage = null, catalogMessage = null, isTestingProvider = false,
+            keySaveMessage = null, keySaveIsError = false
         ) }
         viewModelScope.launch {
             try {
@@ -234,7 +255,8 @@ class SettingsViewModel @Inject constructor(
 
     /** A null key is the explicit removal action; blank keys remain invalid saves. */
     fun saveProviderSettings(key: String?, model: String) {
-        if (!_state.value.providerReady) return
+        if (!_state.value.providerReady || _state.value.isSavingKey || _state.value.isTestingProvider ||
+            (key != null && pendingSettingsWrites > 0)) return
         val removingKey = key == null
         val provider = _state.value.provider
         val error = if (removingKey) null else
@@ -243,12 +265,19 @@ class SettingsViewModel @Inject constructor(
             _state.update { it.copy(providerMessage = error, providerMessageIsError = true) }
             return
         }
+        val epoch = providerEpoch
+        val revision = draftRevision
+        pendingSettingsWrites++
+        _state.update { it.copy(isSavingProviderSettings = true, providerMessage = null,
+            keySaveMessage = null, keySaveIsError = false) }
         viewModelScope.launch {
             try {
                 // Key-only removal cannot overwrite a model saved before state observation.
                 if (removingKey) settingsStore.setApiKey(null, provider)
                 else settingsStore.saveProviderConfig(AiConnectionConfig(provider, key, model))
-                if (_state.value.provider == provider) {
+                val saved = settingsStore.aiConnectionConfig.first()
+                if (epoch == providerEpoch && revision == draftRevision) {
+                    providerSuccessConfig = saved
                     _state.update { it.copy(
                         providerMessage = if (removingKey) "Saved key removed for ${provider.displayName}."
                             else "Saved for ${provider.displayName}.",
@@ -258,7 +287,7 @@ class SettingsViewModel @Inject constructor(
             } catch (e: CancellationException) {
                 throw e
             } catch (_: Exception) {
-                if (_state.value.provider == provider) {
+                if (epoch == providerEpoch && revision == draftRevision) {
                     _state.update { it.copy(
                         providerMessage = if (removingKey) "Could not remove saved key. Please retry."
                             else "Could not save provider settings. Please retry.",
@@ -266,12 +295,16 @@ class SettingsViewModel @Inject constructor(
                     ) }
                 }
             }
+        }.invokeOnCompletion {
+            // Also runs if the scope is cancelled before the coroutine body starts.
+            pendingSettingsWrites--
+            _state.update { it.copy(isSavingProviderSettings = pendingSettingsWrites > 0) }
         }
     }
 
     fun testProviderConnection() {
         val config = activeConfig ?: return
-        if (_state.value.isTestingProvider) return
+        if (_state.value.isTestingProvider || _state.value.isSavingKey || pendingSettingsWrites > 0) return
         config.validationError()?.let { error ->
             _state.update { it.copy(providerMessage = error, providerMessageIsError = true) }
             return
@@ -282,6 +315,7 @@ class SettingsViewModel @Inject constructor(
             try {
                 val result = aiClient.testConnection(config)
                 if (generation == configGeneration) {
+                    providerSuccessConfig = config.takeIf { result.isSuccess }
                     _state.update { it.copy(
                         providerMessage = result.getOrElse { error -> error.message ?: "Provider test failed." },
                         providerMessageIsError = result.isFailure
@@ -309,16 +343,66 @@ class SettingsViewModel @Inject constructor(
         }
     }
 
-    fun setApiKey(key: String) {
-        if (!_state.value.providerReady) return
-        val provider = _state.value.provider
+    fun setApiKey(key: String) = saveApiKey(_state.value.provider, key)
+
+    /** Explicit key-only write: never reads or writes a model draft. */
+    fun saveApiKey(provider: AiProvider, key: String) {
+        if (!_state.value.providerReady || provider != _state.value.provider ||
+            _state.value.isSavingKey || pendingSettingsWrites > 0 || _state.value.isTestingProvider) return
+        apiKeyValidationError(key)?.let { error ->
+            _state.update { it.copy(providerMessage = error, providerMessageIsError = true,
+                keySaveMessage = error, keySaveIsError = true) }
+            return
+        }
+        val epoch = providerEpoch
+        val revision = keyDraftRevision
+        val edits = draftRevision
+        _state.update { it.copy(isSavingKey = true, keySaveMessage = null,
+            keySaveIsError = false, providerMessage = null) }
         viewModelScope.launch {
-            settingsStore.setApiKey(key, provider)
+            try {
+                settingsStore.setApiKey(key, provider)
+                val saved = settingsStore.aiConnectionConfig.first()
+                if (epoch == providerEpoch && revision == keyDraftRevision) {
+                    providerSuccessConfig = saved
+                    _state.update { it.copy(keySaveMessage = "Key saved on this device.",
+                        keySaveIsError = false,
+                        providerMessage = "Key saved on this device.".takeIf { edits == draftRevision },
+                        providerMessageIsError = false) }
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Exception) {
+                if (epoch == providerEpoch && revision == keyDraftRevision) {
+                    _state.update { it.copy(keySaveMessage = "Could not save key. Your edits are still here; please retry.",
+                        keySaveIsError = true,
+                        providerMessage = "Could not save key. Your edits are still here; please retry.",
+                        providerMessageIsError = true) }
+                }
+            }
+        }.invokeOnCompletion {
+            _state.update { it.copy(isSavingKey = false) }
         }
     }
 
+    /** Invalidate request feedback even if an edit is later undone to the saved value. */
+    fun providerDraftEdited(provider: AiProvider, keyChanged: Boolean) {
+        if (provider != _state.value.provider) return
+        draftRevision++
+        providerSuccessConfig = null
+        if (keyChanged) keyDraftRevision++
+        testJob?.cancel()
+        configGeneration++
+        catalogJob?.cancel()
+        _isRefreshingModels.value = false
+        _state.update { it.copy(providerMessage = null, providerMessageIsError = false,
+            isTestingProvider = false,
+            keySaveMessage = if (keyChanged) null else it.keySaveMessage,
+            keySaveIsError = !keyChanged && it.keySaveIsError) }
+    }
+
     fun setSelectedModel(model: String) {
-        if (!_state.value.providerReady || modelIdValidationError(model) != null) return
+        if (!_state.value.providerReady || _state.value.isSavingKey || modelIdValidationError(model) != null) return
         val provider = _state.value.provider
         viewModelScope.launch {
             settingsStore.setSelectedModel(model, provider)
@@ -334,7 +418,7 @@ class SettingsViewModel @Inject constructor(
 
     fun refreshAvailableModels() {
         val config = activeConfig ?: return
-        if (_isRefreshingModels.value) return
+        if (_isRefreshingModels.value || _state.value.isSavingKey || pendingSettingsWrites > 0) return
         val generation = configGeneration
         _isRefreshingModels.value = true
         _state.update { it.copy(catalogMessage = null) }
