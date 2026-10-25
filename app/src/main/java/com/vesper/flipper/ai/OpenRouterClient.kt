@@ -536,6 +536,12 @@ class OpenRouterClient @Inject constructor(
                     "This likely means the response was not parsed correctly.")
             }
 
+            if (content.isBlank() && toolCalls.isNullOrEmpty()) {
+                return ChatCompletionResult.Error(
+                    "The model returned no answer text or usable tool call. No automatic retry was sent. Review any completed tool results before continuing; ask for a summary without repeating those actions."
+                )
+            }
+
             ChatCompletionResult.Success(
                 content = content,
                 toolCalls = toolCalls?.takeIf { it.isNotEmpty() },
