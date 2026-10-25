@@ -23,6 +23,8 @@ import android.util.Log
 import androidx.core.app.ActivityCompat
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
+import androidx.core.content.edit
+import androidx.core.util.size
 import com.hoho.android.usbserial.driver.CdcAcmSerialDriver
 import com.hoho.android.usbserial.driver.ProbeTable
 import com.hoho.android.usbserial.driver.UsbSerialDriver
@@ -2343,7 +2345,7 @@ class FlipperBleService : Service() {
     private fun hasLikelyFlipperManufacturerData(result: ScanResult): Boolean {
         val record = result.scanRecord ?: return false
         val manufacturerData = record.manufacturerSpecificData ?: return false
-        for (index in 0 until manufacturerData.size()) {
+        for (index in 0 until manufacturerData.size) {
             val manufacturerId = manufacturerData.keyAt(index)
             if (manufacturerId in KNOWN_FLIPPER_BLE_MANUFACTURER_IDS) {
                 return true
@@ -2443,7 +2445,9 @@ class FlipperBleService : Service() {
         val existing = prefs.getStringSet(KEY_CONFIRMED_FLIPPER_ADDRESSES, emptySet()).orEmpty()
         if (normalized in existing) return
         val updated = existing.toMutableSet().apply { add(normalized) }
-        prefs.edit().putStringSet(KEY_CONFIRMED_FLIPPER_ADDRESSES, updated).apply()
+        prefs.edit(commit = false) {
+            putStringSet(KEY_CONFIRMED_FLIPPER_ADDRESSES, updated)
+        }
     }
 
     private fun Intent.extractUsbDeviceExtra(): UsbDevice? {
@@ -2563,11 +2567,7 @@ class FlipperBleService : Service() {
                 val intent = Intent(context, FlipperBleService::class.java).apply {
                     action = ACTION_START_FOREGROUND
                 }
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                    context.startForegroundService(intent)
-                } else {
-                    context.startService(intent)
-                }
+                context.startForegroundService(intent)
                 true
             } catch (e: SecurityException) {
                 Log.w(TAG, "Foreground start denied; transport permission may have been revoked", e)
