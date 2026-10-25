@@ -36,6 +36,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.core.net.toUri
 import androidx.hilt.navigation.compose.hiltViewModel
 import coil.compose.AsyncImage
 import coil.request.ImageRequest
@@ -113,7 +114,7 @@ fun ChatScreen(
     val cameraLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.TakePicture()
     ) { success ->
-        val uri = cameraImageUriString?.let { Uri.parse(it) }
+        val uri = cameraImageUriString?.toUri()
         if (success && uri != null) {
             viewModel.addImage(uri)
         } else if (uri != null) {
@@ -129,7 +130,7 @@ fun ChatScreen(
     val videoLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.CaptureVideo()
     ) { success ->
-        val uri = cameraImageUriString?.let { Uri.parse(it) }
+        val uri = cameraImageUriString?.toUri()
         if (success && uri != null) {
             viewModel.addImage(uri)
         }
