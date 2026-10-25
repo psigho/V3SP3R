@@ -60,6 +60,8 @@ fun SettingsScreen(
                         refreshing = isRefreshingModels,
                         onProvider = viewModel::setProvider,
                         onSave = viewModel::saveProviderSettings,
+                        onSaveKey = viewModel::saveApiKey,
+                        onDraftEdited = viewModel::providerDraftEdited,
                         onRefresh = viewModel::refreshAvailableModels,
                         onTest = viewModel::testProviderConnection
                     )

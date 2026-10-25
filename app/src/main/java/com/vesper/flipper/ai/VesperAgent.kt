@@ -12,6 +12,7 @@ import com.vesper.flipper.domain.service.AuditService
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -23,6 +24,8 @@ import kotlinx.serialization.json.Json
 import java.util.UUID
 import javax.inject.Inject
 import javax.inject.Singleton
+import kotlin.coroutines.AbstractCoroutineContextElement
+import kotlin.coroutines.CoroutineContext
 
 /**
  * Callback for requesting a photo capture from smart glasses.
@@ -70,6 +73,14 @@ class VesperAgent @Inject constructor(
     }
 
     private var currentSessionId: String = UUID.randomUUID().toString()
+    private val turnGeneration = java.util.concurrent.atomic.AtomicLong()
+
+    private class RequestOwnership(
+        val sessionId: String,
+        val generation: Long
+    ) : AbstractCoroutineContextElement(Key) {
+        companion object Key : CoroutineContext.Key<RequestOwnership>
+    }
 
     // Credentials are retained only while this exact approval is paused, never persisted.
     private var pendingApprovalConnection: PendingApprovalConnection? = null
@@ -130,7 +141,7 @@ class VesperAgent @Inject constructor(
         // Process with AI — catch unexpected exceptions so the UI never gets
         // stuck in a permanent loading state (e.g. image preprocessing crash).
         return try {
-            processAIResponse(messages)
+            withRequestLifecycle { processAIResponse(messages) }
         } catch (e: Exception) {
             if (e is kotlinx.coroutines.CancellationException) throw e
             _conversationState.value = _conversationState.value.copy(
@@ -198,7 +209,7 @@ class VesperAgent @Inject constructor(
         )
 
         return try {
-            processAIResponse(messages)
+            withRequestLifecycle { processAIResponse(messages) }
         } catch (e: Exception) {
             if (e is kotlinx.coroutines.CancellationException) throw e
             _conversationState.value = _conversationState.value.copy(
@@ -214,14 +225,14 @@ class VesperAgent @Inject constructor(
     /**
      * Continue after tool approval/rejection
      */
-    suspend fun continueAfterApproval(approvalId: String, approved: Boolean): ConversationState {
+    suspend fun continueAfterApproval(approvalId: String, approved: Boolean): ConversationState = withRequestLifecycle {
         val effectiveApprovalId = _conversationState.value.pendingApproval?.id ?: approvalId
         val retained = pendingApprovalConnection?.takeIf {
             it.sessionId == currentSessionId && it.approvalId == effectiveApprovalId
         }
         pendingApprovalConnection = null
         val connection = retained?.connection ?: settingsStore.aiConnectionConfig.first()
-        return withTurnConnection(connection) {
+        withTurnConnection(connection) {
             continueAfterApprovalWithConnection(approvalId, approved, connection)
         }
     }
@@ -316,16 +327,35 @@ class VesperAgent @Inject constructor(
         }
     }
 
+    private suspend fun withRequestLifecycle(block: suspend () -> ConversationState): ConversationState {
+        val sessionId = currentSessionId
+        val generation = turnGeneration.incrementAndGet()
+        try {
+            return withContext(RequestOwnership(sessionId, generation)) { block() }
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            _conversationState.update { state ->
+                if (currentSessionId == sessionId && turnGeneration.get() == generation) {
+                    state.copy(isLoading = false, progress = null,
+                        error = "Request interrupted. No automatic retry was sent. Check any device actions before retrying.")
+                } else state
+            }
+            throw e
+        }
+    }
+
     private suspend fun withTurnConnection(
         connection: AiConnectionConfig,
         block: suspend () -> ConversationState
     ): ConversationState {
-        val sessionId = currentSessionId
+        // Settings loading may suspend past another request; retain the original owner.
+        val ownership = checkNotNull(currentCoroutineContext()[RequestOwnership])
+        val sessionId = ownership.sessionId
+        val generation = ownership.generation
         var completed: ConversationState? = null
         try {
             return withContext(AiConnectionContext(connection)) { block() }.also { completed = it }
         } finally {
-            if (currentSessionId == sessionId) {
+            if (currentSessionId == sessionId && turnGeneration.get() == generation) {
                 // An exception/cancellation or terminal response releases the snapshot.
                 pendingApprovalConnection = completed?.pendingApproval?.let {
                     PendingApprovalConnection(sessionId, it.id, connection)
@@ -400,6 +430,13 @@ class VesperAgent @Inject constructor(
 
             when (result) {
                 is ChatCompletionResult.Error -> {
+                    result.partialContent?.takeIf { it.isNotBlank() }?.let { partial ->
+                        currentMessages.add(ChatMessage(
+                            role = MessageRole.ASSISTANT,
+                            content = partial,
+                            status = MessageStatus.ERROR
+                        ))
+                    }
                     _conversationState.value = _conversationState.value.copy(
                         messages = currentMessages,
                         isLoading = false,
