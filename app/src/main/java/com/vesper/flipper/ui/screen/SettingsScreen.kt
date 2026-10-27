@@ -111,6 +111,61 @@ fun SettingsScreen(
                 }
             }
 
+            // Flipper knowledge is user-authored and separate from provider credentials.
+            item {
+                SettingsSection(title = "Flipper Assist Notes") {
+                    Text(
+                        "Saved notes are sent to the selected AI provider with chat requests. " +
+                            "Do not include API keys, passwords, or other secrets.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Spacer(modifier = Modifier.height(12.dp))
+                    val notesBytes = state.deviceAssistNotesDraft.toByteArray(Charsets.UTF_8).size
+                    val tooLong = notesBytes > SettingsStore.MAX_DEVICE_ASSIST_NOTES_BYTES
+                    OutlinedTextField(
+                        value = state.deviceAssistNotesDraft,
+                        onValueChange = viewModel::editDeviceAssistNotes,
+                        enabled = state.deviceAssistNotesReady && !state.isSavingDeviceAssistNotes,
+                        label = { Text("Device knowledge and firmware notes") },
+                        placeholder = { Text("Add your own verified Flipper details here") },
+                        modifier = Modifier.fillMaxWidth(),
+                        minLines = 5,
+                        maxLines = 12,
+                        isError = tooLong,
+                        shape = RoundedCornerShape(12.dp)
+                    )
+                    Text(
+                        "$notesBytes / ${SettingsStore.MAX_DEVICE_ASSIST_NOTES_BYTES} UTF-8 bytes" +
+                            if (tooLong) " — shorten before saving" else "",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = if (tooLong) MaterialTheme.colorScheme.error
+                            else MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Button(
+                            onClick = viewModel::saveDeviceAssistNotes,
+                            enabled = state.deviceAssistNotesReady && !state.isSavingDeviceAssistNotes &&
+                                !tooLong && state.deviceAssistNotesDraft != state.deviceAssistNotesSaved
+                        ) { Text("Save notes") }
+                        OutlinedButton(
+                            onClick = viewModel::resetDeviceAssistNotes,
+                            enabled = state.deviceAssistNotesReady && !state.isSavingDeviceAssistNotes &&
+                                (state.deviceAssistNotesDraft.isNotEmpty() || state.deviceAssistNotesSaved.isNotEmpty())
+                        ) { Text("Reset notes") }
+                    }
+                    state.deviceAssistNotesMessage?.let { message ->
+                        Text(
+                            message,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = if (state.deviceAssistNotesMessageIsError) MaterialTheme.colorScheme.error
+                                else MaterialTheme.colorScheme.primary
+                        )
+                    }
+                }
+            }
+
             // Connection Section
             item {
                 SettingsSection(title = "Connection") {
