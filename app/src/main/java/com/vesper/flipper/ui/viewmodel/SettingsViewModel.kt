@@ -33,6 +33,12 @@ data class SettingsState(
     val keySaveIsError: Boolean = false,
     val apiKey: String = "",
     val selectedModel: String = SettingsStore.DEFAULT_MODEL,
+    val deviceAssistNotesDraft: String = "",
+    val deviceAssistNotesSaved: String = "",
+    val deviceAssistNotesReady: Boolean = false,
+    val isSavingDeviceAssistNotes: Boolean = false,
+    val deviceAssistNotesMessage: String? = null,
+    val deviceAssistNotesMessageIsError: Boolean = false,
     val aiMaxIterations: Int = SettingsStore.DEFAULT_AI_MAX_ITERATIONS,
     val autoConnect: Boolean = true,
     val defaultProjectPath: String = "/ext/apps_data/vesper",
@@ -85,11 +91,97 @@ class SettingsViewModel @Inject constructor(
     private var draftRevision = 0L
     private var pendingSettingsWrites = 0
     private var providerSuccessConfig: AiConnectionConfig? = null
+    private var deviceAssistRevision = 0L
+    private var deviceAssistDraftEdited = false
 
     init {
         loadSettings()
         observePermissions()
         observeProviderSettings()
+        observeDeviceAssistNotes()
+    }
+
+    private fun observeDeviceAssistNotes() {
+        viewModelScope.launch {
+            settingsStore.deviceAssistNotes.collect { saved ->
+                _state.update { current ->
+                    current.copy(
+                        deviceAssistNotesSaved = saved,
+                        deviceAssistNotesDraft = if (!current.deviceAssistNotesReady ||
+                            !deviceAssistDraftEdited
+                        ) saved else current.deviceAssistNotesDraft,
+                        deviceAssistNotesReady = true
+                    )
+                }
+            }
+        }
+    }
+
+    fun editDeviceAssistNotes(notes: String) {
+        if (!_state.value.deviceAssistNotesReady || _state.value.isSavingDeviceAssistNotes) return
+        deviceAssistRevision++
+        deviceAssistDraftEdited = true
+        _state.update { it.copy(deviceAssistNotesDraft = notes,
+            deviceAssistNotesMessage = null, deviceAssistNotesMessageIsError = false) }
+    }
+
+    fun saveDeviceAssistNotes() = writeDeviceAssistNotes(reset = false)
+
+    fun resetDeviceAssistNotes() = writeDeviceAssistNotes(reset = true)
+
+    private fun writeDeviceAssistNotes(reset: Boolean) {
+        val current = _state.value
+        if (!current.deviceAssistNotesReady || current.isSavingDeviceAssistNotes) return
+        val notes = if (reset) "" else current.deviceAssistNotesDraft
+        if (!reset && notes == current.deviceAssistNotesSaved) return
+        if (reset && notes.isEmpty() && current.deviceAssistNotesSaved.isEmpty()) {
+            deviceAssistRevision++
+            deviceAssistDraftEdited = false
+            _state.update { it.copy(deviceAssistNotesDraft = "",
+                deviceAssistNotesMessage = "Unsaved Flipper Assist Notes cleared.",
+                deviceAssistNotesMessageIsError = false) }
+            return
+        }
+        if (notes.toByteArray(Charsets.UTF_8).size > SettingsStore.MAX_DEVICE_ASSIST_NOTES_BYTES) {
+            _state.update { it.copy(deviceAssistNotesMessage =
+                "Flipper Assist Notes exceed ${SettingsStore.MAX_DEVICE_ASSIST_NOTES_BYTES} UTF-8 bytes.",
+                deviceAssistNotesMessageIsError = true) }
+            return
+        }
+        val revision = deviceAssistRevision
+        val expectedSaved = current.deviceAssistNotesSaved
+        _state.update { it.copy(isSavingDeviceAssistNotes = true, deviceAssistNotesMessage = null,
+            deviceAssistNotesMessageIsError = false) }
+        viewModelScope.launch {
+            try {
+                val wrote = settingsStore.saveDeviceAssistNotesIfUnchanged(notes, expectedSaved)
+                val saved = settingsStore.deviceAssistNotes.first()
+                if (revision == deviceAssistRevision) {
+                    if (!wrote || saved != notes) {
+                        _state.update { it.copy(deviceAssistNotesSaved = saved,
+                            deviceAssistNotesMessage = "Flipper Assist Notes changed elsewhere. Your draft was kept; review before saving again.",
+                            deviceAssistNotesMessageIsError = true) }
+                    } else {
+                        deviceAssistDraftEdited = false
+                        _state.update { it.copy(deviceAssistNotesSaved = saved,
+                            deviceAssistNotesDraft = if (reset) "" else it.deviceAssistNotesDraft,
+                            deviceAssistNotesMessage = if (reset) "Flipper Assist Notes reset."
+                                else "Flipper Assist Notes saved.",
+                            deviceAssistNotesMessageIsError = false) }
+                    }
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Exception) {
+                if (revision == deviceAssistRevision) {
+                    _state.update { it.copy(deviceAssistNotesMessage =
+                        "Could not ${if (reset) "reset" else "save"} Flipper Assist Notes. Please retry.",
+                        deviceAssistNotesMessageIsError = true) }
+                }
+            }
+        }.invokeOnCompletion {
+            _state.update { it.copy(isSavingDeviceAssistNotes = false) }
+        }
     }
 
     private fun loadSettings() {

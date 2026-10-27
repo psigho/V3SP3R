@@ -380,6 +380,14 @@ class VesperAgent @Inject constructor(
         var apiMessages: MutableList<ChatMessage> = currentMessages.toMutableList()
         val hasImages = currentMessages.any { !it.imageAttachments.isNullOrEmpty() }
         if (hasImages) {
+            // Do not send a vision request that the subsequent chat request
+            // must reject for an oversized latest user message.
+            openRouterClient.imageInputContextError(currentMessages, connection)?.let { reason ->
+                _conversationState.value = _conversationState.value.copy(
+                    messages = currentMessages, isLoading = false, progress = null, error = reason
+                )
+                return _conversationState.value
+            }
             if (connection.validationError() == null) {
                 try {
                     apiMessages = openRouterClient.preprocessImagesAsText(currentMessages, connection).toMutableList()

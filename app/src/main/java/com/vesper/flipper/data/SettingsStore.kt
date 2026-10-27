@@ -39,6 +39,36 @@ class SettingsStore internal constructor(private val dataStore: DataStore<Prefer
     val selectedModel: Flow<String> = aiConnectionConfig.map { it.model }
     val openRouterApiKey: Flow<String?> = dataStore.data.map { it[keySlot(AiProvider.OPENROUTER)] }
 
+    // User-authored context shared across providers; never stored in a credential slot.
+    private val DEVICE_ASSIST_NOTES = stringPreferencesKey("device_assist_notes")
+    val deviceAssistNotes: Flow<String> = dataStore.data.map { it[DEVICE_ASSIST_NOTES] ?: "" }
+
+    suspend fun setDeviceAssistNotes(notes: String) {
+        require(notes.toByteArray(Charsets.UTF_8).size <= MAX_DEVICE_ASSIST_NOTES_BYTES) {
+            "Flipper Assist Notes must be at most $MAX_DEVICE_ASSIST_NOTES_BYTES UTF-8 bytes."
+        }
+        dataStore.edit { preferences ->
+            if (notes.isEmpty()) preferences.remove(DEVICE_ASSIST_NOTES)
+            else preferences[DEVICE_ASSIST_NOTES] = notes
+        }
+    }
+
+    /** Reject a stale Settings draft rather than overwriting a newer writer. */
+    suspend fun saveDeviceAssistNotesIfUnchanged(notes: String, expected: String): Boolean {
+        require(notes.toByteArray(Charsets.UTF_8).size <= MAX_DEVICE_ASSIST_NOTES_BYTES) {
+            "Flipper Assist Notes must be at most $MAX_DEVICE_ASSIST_NOTES_BYTES UTF-8 bytes."
+        }
+        var saved = false
+        dataStore.edit { preferences ->
+            if ((preferences[DEVICE_ASSIST_NOTES] ?: "") == expected) {
+                if (notes.isEmpty()) preferences.remove(DEVICE_ASSIST_NOTES)
+                else preferences[DEVICE_ASSIST_NOTES] = notes
+                saved = true
+            }
+        }
+        return saved
+    }
+
     suspend fun setProvider(provider: AiProvider) {
         dataStore.edit { it[PROVIDER] = provider.name.lowercase() }
     }
@@ -330,6 +360,7 @@ class SettingsStore internal constructor(private val dataStore: DataStore<Prefer
         const val DEFAULT_MODEL = "nousresearch/hermes-4-405b"
         // Shimmer: soft, warm female — default TTS voice (OpenAI via OpenRouter)
         const val DEFAULT_TTS_VOICE = "shimmer"
+        const val MAX_DEVICE_ASSIST_NOTES_BYTES = 4096
         const val DEFAULT_AI_MAX_ITERATIONS = 10
         const val MIN_AI_MAX_ITERATIONS = 4
         const val MAX_AI_MAX_ITERATIONS = 20
