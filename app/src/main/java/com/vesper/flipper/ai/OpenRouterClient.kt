@@ -1539,7 +1539,10 @@ class OpenRouterClient @Inject constructor(
         private const val MAX_ASSIST_NOTES_BYTES = 4_096
         private const val MAX_OLD_MESSAGE_CHARS = 2_048
         private const val MAX_TOOL_RESULT_CHARS = 4_096
-        private const val TOOL_CALL_RESPONSE_MAX_TOKENS = 1024
+        // Tool-enabled chat also produces the user's final prose; 1,024 tokens can be
+        // exhausted by model reasoning before a saved-scan summary is complete.
+        // This is a ceiling on one request, not an automatic paid retry.
+        private const val TOOL_CALL_RESPONSE_MAX_TOKENS = 4096
         private const val FORGE_RESPONSE_MAX_TOKENS = 6144
         private const val DEFAULT_RESPONSE_MAX_TOKENS = 720
         /** Max input size for JSON repair to prevent resource exhaustion. */
