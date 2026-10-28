@@ -2,7 +2,7 @@
 
 ## Contract
 
-`ProviderModelPresets.forProvider(provider: AiProvider): List<ModelInfo>` returns a small, deterministic, provider-scoped list. These are **offline shortcuts**, not automatic fallbacks, defaults, a model migration, or an exhaustive catalog. The function performs no networking or settings access. Nothing in this change reads, overwrites, or normalizes a saved model choice; list order must not be treated as an automatic selection. UI, ViewModels, existing fallback lists, provider defaults, and build settings are outside this change.
+`ProviderModelPresets.forProvider(provider: AiProvider): List<ModelInfo>` returns a small, deterministic, provider-scoped list. These are **offline shortcuts**, not automatic fallbacks, defaults, a model migration, or an exhaustive catalog. The function performs no networking or settings access. Nothing in the preset function reads, overwrites, or normalizes a saved model choice; list order must not be treated as an automatic selection. The broader provider-settings UI, ViewModels, and build-time update policy are separate parts of this feature PR and need their own integration tests.
 
 ## Vetted data: independently verified 2026-10-25
 
