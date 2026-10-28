@@ -83,11 +83,7 @@ Executed with the cached Kotlin 2.2.10 compiler and JUnit 4.13.2 in a standalone
 
 The harness compiles the real `AiProvider.kt`, real preset implementation, real JUnit test, and the `ModelInfo` declaration extracted verbatim from `SettingsStore.kt`; it does not compile the Android-dependent settings class. This verifies the data component, not an Android build, APK, UI integration, saved-preference integration, or live model compatibility. No Windows Gradle/full app compilation was run and protected templates were untouched.
 
-Retrieval bodies, exact selected catalog records, SHA-256 evidence manifest, assertion-failure/pass logs, and the standalone runner are outside the repository at `C:/Users/RainO/AppData/Local/hermes/cache/scratch/provider-presets/`. They are local evidence, not committed fixtures; scratch storage is transient. To re-run on this workstation:
-
-```bash
-python C:/Users/RainO/AppData/Local/hermes/cache/scratch/provider-presets/run_tests.py final
-```
+The dated catalog retrieval bodies and standalone-harness logs were not committed; they are not a substitute for fresh public catalog checks. The checked-in regression suite runs under the repository's `:app:testDebugUnitTest` task. Later full-app CI on the original feature branch also ran that task; a transplanted upstream PR tree needs its own CI result. Keep workstation-specific evidence paths and credentials out of the public source.
 
 The checked-in test uses the repository's existing JUnit dependency and standard `app/src/test/java` source set. Refresh the verified lists, documentation date, and exact-ID tests together after repeating provider-specific public catalog checks. Never infer one provider's ID from another provider's spelling.
 

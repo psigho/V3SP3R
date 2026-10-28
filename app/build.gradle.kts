@@ -18,8 +18,8 @@ val localProps = Properties().apply {
 }
 
 // The installed build owns its update channel. Upstream PR merges never switch it.
-val updateRepository = providers.gradleProperty("vesper.updateRepository").orElse("psigho/V3SP3R").get()
-val updateChannel = providers.gradleProperty("vesper.updateChannel").orElse("psigho-preview").get()
+val updateRepository = providers.gradleProperty("vesper.updateRepository").orElse("elder-plinius/V3SP3R").get()
+val updateChannel = providers.gradleProperty("vesper.updateChannel").orElse("upstream-stable").get()
 require(Regex("[A-Za-z0-9][A-Za-z0-9_.-]{0,99}/[A-Za-z0-9][A-Za-z0-9_.-]{0,99}").matches(updateRepository))
 require(Regex("[A-Za-z0-9][A-Za-z0-9_.-]{0,63}").matches(updateChannel))
 

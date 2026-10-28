@@ -37,6 +37,11 @@ jobs:
         run: |
           python -c 'import os, subprocess; sdk=os.path.join(os.environ["ANDROID_HOME"], "cmdline-tools/latest/bin/sdkmanager"); subprocess.run([sdk, "--licenses"], input="y\n"*100, text=True, check=True); subprocess.run([sdk, "platforms;android-35", "build-tools;36.0.0"], input="y\n"*100, text=True, check=True)'
 
+      # Upstream main still tracks a developer-specific SDK path; PR #82 removes it.
+      - name: Prefer runner Android SDK over tracked local.properties
+        shell: bash
+        run: rm -f local.properties
+
       - name: Run unit tests, lint and build
         shell: bash
         run: |

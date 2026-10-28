@@ -4,7 +4,7 @@
 
 Settings → About → **Check for updates** performs an explicit, unauthenticated GitHub release lookup. It does not poll in the background, send AI-provider keys, download an APK, install anything, uninstall the app, clear data, or switch repositories.
 
-The current custom build is pinned to `psigho/V3SP3R`, channel `psigho-preview`. Merging a PR into `elder-plinius/V3SP3R` does not change an already installed build's source. A Git commit or merged PR is not itself a published APK release.
+This proposed upstream source build defaults to `elder-plinius/V3SP3R`, channel `upstream-stable`. Fork builds can pin a different repository and channel explicitly at build time. Merging a PR does not change an already installed build's source. A Git commit or merged PR is not itself a published APK release; no upstream release is presumed to carry the metadata contract below.
 
 Only a strictly greater **Android versionCode** can produce **View update release**. Version names, tags, dates, GitHub's “latest” designation and list ordering do not determine upgrade ordering. Older releases report that the installed build is ahead; equal versions are not offered.
 
@@ -14,14 +14,14 @@ Matching release metadata is **not verification of downloaded APK bytes**. The b
 
 ## Build configuration
 
-The current source targets versionCode `3`, versionName `1.0.2-providers-updates`. An older APK already built or installed cannot acquire the button merely because this source changed.
+The proposed source targets versionCode `7`, versionName `1.0.6-grounded-assist`. An older APK already built or installed cannot acquire the button merely because this source changed.
 
 Repository and channel are build-time properties:
 
-- `-Pvesper.updateRepository=psigho/V3SP3R`
-- `-Pvesper.updateChannel=psigho-preview`
+- `-Pvesper.updateRepository=psigho/V3SP3R` (example fork override)
+- `-Pvesper.updateChannel=psigho-preview` (example fork override)
 
-An upstream maintainer can explicitly choose `elder-plinius/V3SP3R` and a channel such as `upstream-stable` for their build. An already installed fork does not silently migrate there. Different signing keys also prevent a normal in-place update; a PR does not transfer signing identity. Private keys must never be committed or attached to a release. Retain the existing signing key for ongoing builds of the same installation channel.
+The upstream defaults are a proposed policy, not a promise that a compatible signed release exists. A maintainer can override them for their release line. An already installed fork does not silently migrate to upstream. Different signing keys also prevent a normal in-place update; a PR does not transfer signing identity. Private keys must never be committed or attached to a release. Retain the existing signing key for ongoing builds of the same installation channel.
 
 `UPDATE_CAPABILITIES` is the installed build's required set. The current set is:
 
@@ -39,8 +39,8 @@ Attach the actual signed APK to a normal, published GitHub release. Add exactly 
 ```vesper-update-v1
 {
   "schemaVersion": 1,
-  "repository": "psigho/V3SP3R",
-  "channel": "psigho-preview",
+  "repository": "elder-plinius/V3SP3R",
+  "channel": "upstream-stable",
   "packageName": "com.vesper.flipper",
   "versionCode": 4,
   "versionName": "EXAMPLE-NOT-PUBLISHED",
